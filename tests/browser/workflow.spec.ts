@@ -1,0 +1,150 @@
+import { expect, test, type Page } from "@playwright/test";
+
+async function signIn(page: Page) {
+  await page.goto("/owner");
+  await page.getByLabel("Password").fill("browser-test-password");
+  await page.getByRole("button",{name:"Sign in",exact:true}).click();
+  await expect(page.getByRole("heading", { name: "Welcome, Ram" })).toBeVisible();
+}
+
+async function placeSample(page: Page, express = false, counter = false) {
+  await page.goto("/shop/printflow-demo");
+  await expect(page.getByText("PrintEvo Smart Xerox Center")).toBeVisible();
+  await page.getByRole("button", { name: "Use a sample PDF" }).click();
+  await expect(page.getByText("4 pages ·", { exact: false })).toBeVisible();
+  await page.getByRole("button", { name: "Continue to settings" }).click();
+  if (express) {
+    await page.getByLabel("Color mode").selectOption("COLOR");
+    await page.getByLabel("Sides").selectOption("true");
+    await page.getByLabel("Copies").fill("2");
+    await page.getByLabel("Pages", { exact: true }).fill("1-2");
+  }
+  await page.getByRole("button", { name: "Continue to service" }).click();
+  if (express) await page.getByRole("button", { name: /Express.*Priority queue/ }).click();
+  await page.getByRole("button", { name: "Continue to payment" }).click();
+  if (counter) await page.getByRole("button", { name: /Pay at counter/ }).click();
+  await page.getByRole("button", { name: "Place order" }).click();
+  const heading = page.getByRole("heading", { name: /^PF-\d{4,10}$/ });
+  await expect(heading).toBeVisible();
+  return (await heading.textContent())!;
+}
+
+test("separate customer and owner sessions stay live through payment, printing, pickup and cleanup", async ({ browser, baseURL }) => {
+  const ownerContext = await browser.newContext({ baseURL });
+  const customerContext = await browser.newContext({ baseURL });
+  const owner = await ownerContext.newPage();
+  const customer = await customerContext.newPage();
+  const errors: string[] = [];
+  owner.on("pageerror", error => errors.push(error.message));
+  customer.on("pageerror", error => errors.push(error.message));
+  await signIn(owner);
+  await expect(owner.getByText("Live sync", { exact: true })).toBeVisible();
+  const token = await placeSample(customer, true);
+  const line = owner.getByRole("row").filter({ hasText: token });
+  await expect(line.getByText("Awaiting payment")).toBeVisible();
+  await expect(owner.getByRole("status").filter({ hasText: "New Express order " + token })).toBeVisible();
+  await customer.getByRole("button", { name: "Simulate payment" }).click();
+  await expect(line.getByText("Queued")).toBeVisible();
+  await expect(customer.getByText("Position 1 in the Express queue")).toBeVisible();
+  await owner.getByRole("button", { name: token }).click();
+  const dialog = owner.getByRole("dialog", { name: token });
+  await dialog.getByLabel("Compatible printer").selectOption("2");
+  await dialog.getByRole("button", { name: "Assign printer" }).click();
+  await expect(customer.getByRole("heading", { name: "Assigned" })).toBeVisible();
+  await dialog.getByRole("button", { name: "Start simulated print" }).click();
+  await expect(customer.getByRole("heading", { name: "Printing", exact: true })).toBeVisible();
+  const projection = await (await owner.request.get("/api/shops/printflow-demo/staff/projection")).json();
+  const active = projection.orders.find((item: { token: string }) => item.token === token);
+  expect(active.status).toBe("PRINTING");
+  expect(active.printerId).toBe(2);
+  expect(active.avatarId).toMatch(/^customer-/);
+  expect(active).not.toHaveProperty("fileName");
+  await customer.reload();
+  await expect(customer.getByRole("heading", { name: token })).toBeVisible();
+  await dialog.getByRole("button", { name: "Mark ready for pickup" }).click({ timeout: 35000 });
+  await expect(customer.getByRole("heading", { name: "Ready for pickup", exact: true })).toBeVisible();
+  const code = (await customer.getByLabel("Collection code").textContent())!;
+  await dialog.getByLabel("Collection code").fill(code);
+  await dialog.getByRole("button", { name: "Verify pickup" }).click();
+  await expect(customer.getByRole("heading", { name: "Completed", exact: true })).toBeVisible();
+  await expect(customer.getByText("Temporary file removed", { exact: true })).toBeVisible();
+  await expect(customer.getByText("Printing completed", { exact: true })).toBeVisible();
+  const response = await owner.request.get("/api/shops/printflow-demo/staff/events?after=0");
+  const events = await response.json();
+  const changes = events.filter((event: { payload: { token?: string } }) => event.payload.token === token);
+  expect(changes.filter((event: { type: string }) => event.type === "ORDER_COMPLETED")).toHaveLength(1);
+  expect(errors).toEqual([]);
+  await ownerContext.close();
+  await customerContext.close();
+});
+
+test("QR points to the current shop and mobile Normal orders recover after disconnect", async ({ browser, baseURL }) => {
+  const staffContext = await browser.newContext({ baseURL });
+  const mobileContext = await browser.newContext({ baseURL, viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const owner = await staffContext.newPage();
+  const customer = await mobileContext.newPage();
+  await signIn(owner);
+  await owner.getByRole("button", { name: "Shop QR code" }).click();
+  await expect(owner.getByRole("img", { name: "QR code for this shop’s ordering page" })).toBeVisible();
+  const qrLink = await owner.getByRole("textbox", { name: "Customer order link" }).inputValue();
+  await owner.getByRole("button", { name: "Close", exact: true }).click();
+  await customer.goto(qrLink);
+  await expect(customer.getByText("Velachery, Chennai")).toBeVisible();
+  await expect.poll(() => customer.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await customer.getByRole("button", { name: "Use a sample PDF" }).click();
+  await customer.getByRole("button", { name: "Preview", exact: true }).click();
+  await expect(customer.getByLabel("Preview of page 1")).toBeVisible();
+  await customer.getByRole("button", { name: "Next page" }).click();
+  await expect(customer.getByLabel("Preview of page 2")).toBeVisible();
+  await customer.getByRole("button", { name: "Hide preview" }).click();
+  await customer.getByRole("button", { name: "Continue to settings" }).click();
+  await customer.getByRole("button", { name: "Continue to service" }).click();
+  await customer.getByRole("button", { name: "Continue to payment" }).click();
+  await customer.getByRole("button", { name: /Pay at counter/ }).click();
+  await customer.getByRole("button", { name: "Place order" }).click();
+  const heading = customer.getByRole("heading", { name: /^PF-\d{4,10}$/ });
+  await expect(heading).toBeVisible();
+  const token = (await heading.textContent())!;
+  await expect(customer.getByText("Due at counter")).toBeVisible();
+  await expect(customer.getByText("Position 1 in the Normal queue")).toBeVisible();
+  expect((await owner.request.get("/api/shops/printflow-demo/orders/" + token)).status()).toBe(401);
+  await mobileContext.setOffline(true);
+  await owner.getByRole("button", { name: token }).click();
+  const dialog = owner.getByRole("dialog", { name: token });
+  await dialog.getByLabel("Compatible printer").selectOption("1");
+  await dialog.getByRole("button", { name: "Assign printer" }).click();
+  await expect(dialog.getByText("Assigned", { exact: true })).toBeVisible();
+  await mobileContext.setOffline(false);
+  await expect(customer.getByRole("heading", { name: "Assigned", exact: true })).toBeVisible();
+  await customer.reload();
+  await expect(customer.getByRole("heading", { name: "Assigned", exact: true })).toBeVisible();
+  await staffContext.close();
+  await mobileContext.close();
+});
+
+test("owner pricing changes reach checkout and generated demo orders appear in analytics", async ({ browser, baseURL }) => {
+  const staffContext = await browser.newContext({ baseURL });
+  const customerContext = await browser.newContext({ baseURL });
+  const owner = await staffContext.newPage();
+  const demo = await customerContext.newPage();
+  await signIn(owner);
+  await owner.getByRole("link", { name: "Shop settings" }).click();
+  await owner.getByLabel("B&W per page").fill("3");
+  await owner.getByRole("button", { name: "Save settings" }).click();
+  await expect(owner.getByText("Settings saved.")).toBeVisible();
+  await demo.goto("/demo");
+  await demo.getByRole("button", { name: "Generate sample orders" }).click();
+  await expect(demo.getByRole("button", { name: "Sample orders created" })).toBeDisabled();
+  const examples = demo.getByRole("link", { name: /^PF-\d+/ });
+  await expect(examples).toHaveCount(3);
+  await examples.first().click();
+  const receipt = demo.locator(".tracking-summary");
+  await expect(receipt.getByText("₹60", { exact: true }).first()).toBeVisible();
+  await expect(demo.getByRole("heading", { name: "Queued", exact: true })).toBeVisible();
+  await owner.getByRole("link", { name: "Analytics" }).click();
+  await expect(owner.getByRole("heading", { name: "Revenue by day" })).toBeVisible();
+  await expect(owner.getByRole("heading", { name: "Printer utilization" })).toBeVisible();
+  await expect(owner.getByRole("heading", { name: "Service demand" })).toBeVisible();
+  await staffContext.close();
+  await customerContext.close();
+});
